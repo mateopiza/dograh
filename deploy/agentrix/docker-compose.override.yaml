@@ -1,0 +1,181 @@
+# Dograh detrás del Traefik de Dokploy (VPS de Agentrix).
+# =================================================================
+# Se aplica ENCIMA del docker-compose.yaml de la raíz, sin tocarlo:
+#
+#   docker compose -p dograh --env-file .env \
+#     -f docker-compose.yaml -f deploy/agentrix/docker-compose.override.yaml \
+#     --profile local-turn up -d
+#
+# Guía completa (en español): deploy/agentrix/README.md
+#
+# Qué cambia frente al compose base:
+#   - Traefik (red externa de Dokploy) es la entrada: UI en DOGRAH_UI_HOST,
+#     API en DOGRAH_API_HOST. Sin nginx propio ni puertos 80/443 del host.
+#   - Ningún servicio web publica puertos en el host. Postgres y Redis dejaban
+#     5432/6379 abiertos en 0.0.0.0 (Docker se salta UFW); aquí se eliminan.
+#   - Imágenes con versión fijada (DOGRAH_VERSION), nunca `latest`.
+#   - Telemetría apagada de verdad: además de ENABLE_TELEMETRY=false se vacían
+#     las claves de PostHog, porque el API envía eventos siempre que haya clave
+#     (api/services/posthog_client.py no consulta ENABLE_TELEMETRY).
+#   - Registro cerrado por defecto (ENABLE_SIGNUP=false); se abre solo para
+#     crear el primer usuario.
+#   - coturn corre con el perfil `local-turn` (UDP público, no pasa por Traefik
+#     ni por el túnel de Cloudflare). Los perfiles `remote` (nginx) y `tunnel`
+#     (cloudflared) quedan inutilizables para no chocar con Traefik.
+#   - MinIO se publica solo para leer objetos (GET/HEAD). La subida directa
+#     desde el navegador (PUT) queda limitada a DOGRAH_UPLOAD_ALLOWED_IPS.
+#
+# Requiere Docker Compose >= 2.24.4 (etiquetas !reset / !override).
+# Las reglas de Traefik usan sintaxis v3 (PathRegexp, Method con un argumento).
+# =================================================================
+
+services:
+  postgres:
+    restart: unless-stopped
+    ports: !reset []
+
+  redis:
+    restart: unless-stopped
+    ports: !reset []
+
+  minio:
+    restart: unless-stopped
+    # Sin nombre fijo: `minio` podría chocar con otro stack del VPS.
+    container_name: !reset null
+    # Consola (9001) sin publicar: usar un túnel SSH o `docker compose exec`.
+    ports: !reset []
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-dokploy-network}"
+      # Lectura de grabaciones y transcripciones. La regex exige una clave de
+      # objeto después del bucket, así que el listado del bucket (GET
+      # /voice-audio/) no se expone. DELETE tampoco.
+      - "traefik.http.routers.dograh-files.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`) && PathRegexp(`^/voice-audio/.+`) && (Method(`GET`) || Method(`HEAD`))"
+      - "traefik.http.routers.dograh-files.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.dograh-files.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.dograh-files.priority=30"
+      - "traefik.http.routers.dograh-files.service=dograh-files"
+      # Subidas directas del navegador (documentos de conocimiento, CSV de
+      # campañas, audios de saludo). El bucket acepta PUT anónimo, así que
+      # solo se permite desde las IPs listadas. Por defecto, nadie.
+      - "traefik.http.routers.dograh-files-upload.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`) && PathRegexp(`^/voice-audio/.+`) && (Method(`PUT`) || Method(`OPTIONS`))"
+      - "traefik.http.routers.dograh-files-upload.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.dograh-files-upload.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.dograh-files-upload.priority=30"
+      - "traefik.http.routers.dograh-files-upload.service=dograh-files"
+      - "traefik.http.routers.dograh-files-upload.middlewares=dograh-upload-allowlist"
+      - "traefik.http.middlewares.dograh-upload-allowlist.ipallowlist.sourcerange=${DOGRAH_UPLOAD_ALLOWED_IPS:-127.0.0.1/32}"
+      - "traefik.http.services.dograh-files.loadbalancer.server.port=9000"
+    networks:
+      - app-network
+      - traefik
+
+  # Solo se usa con --profile local-turn, para renderizar turnserver.conf.
+  # ENVIRONMENT=local a propósito: en modo production este init también exige
+  # certificados y renderiza el nginx del perfil `remote`, que aquí no existe.
+  dograh-init:
+    container_name: !reset null
+    environment:
+      ENVIRONMENT: "local"
+      TURN_HOST: "${TURN_HOST:?TURN_HOST debe ser la IP pública del VPS}"
+      TURN_SECRET: "${TURN_SECRET:?TURN_SECRET es obligatorio}"
+
+  coturn:
+    container_name: !reset null
+
+  # Nunca arrancan en este despliegue: nginx pelearía por 80/443 con Traefik y
+  # cloudflared no sirve para el audio (UDP).
+  nginx:
+    profiles: !override ["disabled-agentrix"]
+  cloudflared:
+    profiles: !override ["disabled-agentrix"]
+
+  api:
+    image: ${REGISTRY:-dograhai}/dograh-api:${DOGRAH_VERSION:-1.47.0}
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      # production: filtra candidatos ICE privados y ordena TURN con UDP primero.
+      ENVIRONMENT: "production"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET debe ser un secreto fuerte}"
+
+      # Origen público del API: webhooks de Twilio, wss:// de medios, URLs de
+      # descarga del webhook post-llamada y objetos de MinIO.
+      PUBLIC_HOST: "${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
+      PUBLIC_BASE_URL: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
+      BACKEND_API_ENDPOINT: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
+      MINIO_PUBLIC_ENDPOINT: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
+      UI_APP_URL: "https://${DOGRAH_UI_HOST:-voice.agentrixlabs.com.co}"
+
+      # Traefik solo apunta a un puerto (8000). Con más workers, los demás
+      # quedarían ociosos. Escalar en vertical.
+      FASTAPI_WORKERS: "1"
+
+      # TURN: IP pública del VPS (no un host detrás del proxy de Cloudflare).
+      ENABLE_COTURN: "true"
+      SERVER_IP: "${TURN_HOST:?TURN_HOST debe ser la IP pública del VPS}"
+      TURN_HOST: "${TURN_HOST:?TURN_HOST debe ser la IP pública del VPS}"
+      TURN_SECRET: "${TURN_SECRET:?TURN_SECRET es obligatorio}"
+
+      # Telemetría apagada. Vaciar la clave es lo que realmente la corta.
+      ENABLE_TELEMETRY: "false"
+      POSTHOG_API_KEY: ""
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-dokploy-network}"
+      # Host del API: REST, WebSocket de señalización WebRTC y WebSocket de
+      # medios de Twilio (/api/v1/telephony/ws/...). Traefik hace el upgrade
+      # de WebSocket sin etiquetas extra.
+      - "traefik.http.routers.dograh-api-web.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`)"
+      - "traefik.http.routers.dograh-api-web.entrypoints=${TRAEFIK_WEB_ENTRYPOINT:-web}"
+      - "traefik.http.routers.dograh-api-web.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.dograh-api-web.service=dograh-api"
+      - "traefik.http.routers.dograh-api.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`)"
+      - "traefik.http.routers.dograh-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.dograh-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.dograh-api.priority=10"
+      - "traefik.http.routers.dograh-api.service=dograh-api"
+      # /api/v1 también en el host de la UI (mismo origen), igual que el nginx
+      # oficial. Cubre el arranque de la UI antes de conocer BACKEND_API_ENDPOINT
+      # y los WebSockets, que el proxy interno de Next.js no transporta.
+      - "traefik.http.routers.dograh-ui-api.rule=Host(`${DOGRAH_UI_HOST:-voice.agentrixlabs.com.co}`) && PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.dograh-ui-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.dograh-ui-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.dograh-ui-api.priority=20"
+      - "traefik.http.routers.dograh-ui-api.service=dograh-api"
+      - "traefik.http.services.dograh-api.loadbalancer.server.port=8000"
+    networks:
+      - app-network
+      - traefik
+
+  ui:
+    image: ${REGISTRY:-dograhai}/dograh-ui:${DOGRAH_VERSION:-1.47.0}
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      ENABLE_TELEMETRY: "false"
+      POSTHOG_KEY: ""
+      NEXT_TELEMETRY_DISABLED: "1"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-dokploy-network}"
+      - "traefik.http.routers.dograh-ui-web.rule=Host(`${DOGRAH_UI_HOST:-voice.agentrixlabs.com.co}`)"
+      - "traefik.http.routers.dograh-ui-web.entrypoints=${TRAEFIK_WEB_ENTRYPOINT:-web}"
+      - "traefik.http.routers.dograh-ui-web.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.dograh-ui-web.service=dograh-ui"
+      - "traefik.http.routers.dograh-ui.rule=Host(`${DOGRAH_UI_HOST:-voice.agentrixlabs.com.co}`)"
+      - "traefik.http.routers.dograh-ui.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.dograh-ui.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.dograh-ui.priority=1"
+      - "traefik.http.routers.dograh-ui.service=dograh-ui"
+      - "traefik.http.services.dograh-ui.loadbalancer.server.port=3010"
+    networks:
+      - app-network
+      - traefik
+
+networks:
+  # Red externa a la que está conectado el Traefik de Dokploy.
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-dokploy-network}
