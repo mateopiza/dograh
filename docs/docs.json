@@ -173,6 +173,7 @@
               "deployment/introduction",
               "deployment/docker",
               "deployment/authentication",
+              "deployment/organization-provisioning",
               "deployment/custom-domain",
               "deployment/scaling",
               "deployment/update",

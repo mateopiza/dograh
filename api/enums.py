@@ -179,6 +179,9 @@ class OrganizationConfigurationKey(Enum):
     ORGANIZATION_BOOTSTRAP = (
         "ORGANIZATION_BOOTSTRAP"  # Single-winner lease for post-signup provisioning
     )
+    ADMIN_PROVISIONING = (
+        "ADMIN_PROVISIONING"  # Name, external ref and status of admin-API-created orgs
+    )
 
 
 class UserConfigurationKey(Enum):

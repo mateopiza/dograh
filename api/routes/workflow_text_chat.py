@@ -36,6 +36,10 @@ class CreateTextChatSessionRequest(BaseModel):
     name: str | None = None
     initial_context: Dict[str, Any] | None = None
     annotations: Dict[str, Any] | None = None
+    # The editor's tester chats against the draft. Integrations that serve
+    # real traffic over text pass false to run the published version, like a
+    # call does.
+    use_draft: bool = True
 
 
 class AppendTextChatMessageRequest(BaseModel):
@@ -180,7 +184,7 @@ async def create_text_chat_session(
             db_client,
             workflow,
             initial_context=merge_external_initial_context({}, request.initial_context),
-            use_draft=True,
+            use_draft=request.use_draft,
             include_template_context=True,
         )
         workflow_run = await db_client.create_workflow_run(
