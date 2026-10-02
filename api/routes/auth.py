@@ -6,7 +6,7 @@ from api.db.models import UserModel
 from api.enums import PostHogEvent
 from api.schemas.auth import AuthResponse, LoginRequest, SignupRequest, UserResponse
 from api.services.auth.depends import get_user, require_local_auth
-from api.services.organization_bootstrap import ensure_organization_bootstrapped
+from api.services.organization_provisioning import attach_owner_to_new_organization
 from api.services.posthog_client import capture_event
 from api.utils.auth import create_jwt_token, hash_password, verify_password
 
@@ -38,24 +38,14 @@ async def signup(request: SignupRequest):
         name=request.name,
     )
 
-    # Create organization for the user
-    org_provider_id = f"org_{user.provider_id}"
-    organization, _ = await db_client.get_or_create_organization_by_provider_id(
-        org_provider_id=org_provider_id, user_id=user.id
-    )
-
-    # Link user to organization
-    await db_client.add_user_to_organization(user.id, organization.id)
-    await db_client.update_user_selected_organization(user.id, organization.id)
-
-    # Create default service configuration. This never raises, so signup still
-    # succeeds if MPS is down; `_handle_oss_auth` re-enters bootstrap on the
-    # user's subsequent authenticated requests, so a failure here is recovered
-    # rather than permanent. Doing it here anyway means the common case has a
-    # model configuration and SIP connectivity by the time the UI first loads.
-    await ensure_organization_bootstrapped(
-        organization.id,
-        created_by=user.provider_id,
+    # Create the user's organization, select it and provision default services.
+    # Bootstrapping never raises, so signup still succeeds if MPS is down;
+    # `_handle_oss_auth` re-enters bootstrap on the user's subsequent
+    # authenticated requests, so a failure here is recovered rather than
+    # permanent. Doing it here anyway means the common case has a model
+    # configuration and SIP connectivity by the time the UI first loads.
+    organization, _ = await attach_owner_to_new_organization(
+        user, f"org_{user.provider_id}"
     )
 
     # Create JWT token

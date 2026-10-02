@@ -1,0 +1,58 @@
+---
+title: "Organization provisioning API"
+description: "Create one organization per customer from your own platform, with an API key, without user signup."
+---
+
+If you run Dograh behind your own product and host **one organization per customer**, you can create those organizations from your backend instead of signing up a user for each one. The API is off by default.
+
+## Enable it
+
+Set a long random token in the API environment and restart the API:
+
+```bash
+DOGRAH_ADMIN_TOKEN="$(openssl rand -hex 32)"
+```
+
+When `DOGRAH_ADMIN_TOKEN` is not set, every route below answers `404`. Send the token in the `X-Dograh-Admin-Token` header. A wrong or missing token gets `401`.
+
+<Warning>
+The token can create organizations and issue their API keys. Keep it on your backend only, and rotate it by changing the variable.
+</Warning>
+
+## Create an organization
+
+```bash
+curl -X POST "$DOGRAH_URL/api/v1/admin/organizations" \
+  -H "X-Dograh-Admin-Token: $DOGRAH_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Acme", "externalRef": "workspace-123", "bootstrapManagedServices": false}'
+```
+
+```json
+{ "organizationId": 42, "apiKey": "dgr_..." }
+```
+
+- The organization is owned by a service user with no email or password, so nobody can sign in to it. Use the returned key in the `X-API-Key` header for every other API call.
+- Dograh stores only the key's hash. Save the key when you receive it.
+- `externalRef` is your identifier for the customer (letters, digits, `_ . : -`). A second call with the same `externalRef` returns `409` with the existing `organizationId` and no key. Rotate to get a new one.
+- `bootstrapManagedServices` defaults to `true`, which provisions Dograh-managed models and SIP exactly like signup. Pass `false` when you will load the customer's own provider keys through `/api/v1/organizations/model-configurations/v2`.
+
+## Rotate the API key
+
+```bash
+curl -X POST "$DOGRAH_URL/api/v1/admin/organizations/42/api-keys/rotate" \
+  -H "X-Dograh-Admin-Token: $DOGRAH_ADMIN_TOKEN"
+```
+
+Returns a new `{ organizationId, apiKey }`. Every previous key of the organization stops working.
+
+## Deactivate an organization
+
+```bash
+curl -X DELETE "$DOGRAH_URL/api/v1/admin/organizations/42" \
+  -H "X-Dograh-Admin-Token: $DOGRAH_ADMIN_TOKEN"
+```
+
+Archives all of the organization's API keys. No workflows, runs, recordings or configuration are deleted. Phone numbers that already point at its workflows keep routing calls, so detach them first if calls must stop too. A deactivated organization cannot be rotated (`409`).
+
+Only organizations created through this API can be rotated or deactivated here. Any other id returns `404`.

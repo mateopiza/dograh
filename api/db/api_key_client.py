@@ -106,3 +106,26 @@ class APIKeyClient(BaseDBClient):
             )
             await session.commit()
             return result.rowcount > 0
+
+    async def archive_active_api_keys_for_organization(
+        self, organization_id: int, keep_api_key_id: Optional[int] = None
+    ) -> int:
+        """Archive every live API key of an organization, except
+        ``keep_api_key_id`` when given. Returns how many were archived."""
+        from datetime import datetime, timezone
+
+        conditions = [
+            APIKeyModel.organization_id == organization_id,
+            APIKeyModel.archived_at.is_(None),
+        ]
+        if keep_api_key_id is not None:
+            conditions.append(APIKeyModel.id != keep_api_key_id)
+
+        async with self.async_session() as session:
+            result = await session.execute(
+                APIKeyModel.__table__.update()
+                .where(and_(*conditions))
+                .values(is_active=False, archived_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+            return result.rowcount
