@@ -22,8 +22,8 @@
 #   - coturn corre con el perfil `local-turn` (UDP público, no pasa por Traefik
 #     ni por el túnel de Cloudflare). Los perfiles `remote` (nginx) y `tunnel`
 #     (cloudflared) quedan inutilizables para no chocar con Traefik.
-#   - MinIO se publica solo para leer objetos (GET/HEAD). La subida directa
-#     desde el navegador (PUT) queda limitada a DOGRAH_UPLOAD_ALLOWED_IPS.
+#   - Sin MinIO: grabaciones, transcripciones y archivos van a un S3 externo
+#     (Megas4) con URLs firmadas. MinIO ya no publica imágenes gratuitas.
 #
 # Requiere Docker Compose >= 2.24.4 (etiquetas !reset / !override).
 # Las reglas de Traefik usan sintaxis v3 (PathRegexp, Method con un argumento).
@@ -38,37 +38,12 @@ services:
     restart: unless-stopped
     ports: !reset []
 
+  # Almacenamiento: S3 externo (Megas4) en lugar de MinIO. MinIO dejó de
+  # publicar imágenes gratuitas (quay.io/minio/minio y minio/minio ya no se
+  # pueden descargar), así que el servicio queda desactivado y el API guarda
+  # grabaciones, transcripciones y archivos en S3_BUCKET con URLs firmadas.
   minio:
-    restart: unless-stopped
-    # Sin nombre fijo: `minio` podría chocar con otro stack del VPS.
-    container_name: !reset null
-    # Consola (9001) sin publicar: usar un túnel SSH o `docker compose exec`.
-    ports: !reset []
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-dokploy-network}"
-      # Lectura de grabaciones y transcripciones. La regex exige una clave de
-      # objeto después del bucket, así que el listado del bucket (GET
-      # /voice-audio/) no se expone. DELETE tampoco.
-      - "traefik.http.routers.dograh-files.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`) && PathRegexp(`^/voice-audio/.+`) && (Method(`GET`) || Method(`HEAD`))"
-      - "traefik.http.routers.dograh-files.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
-      - "traefik.http.routers.dograh-files.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
-      - "traefik.http.routers.dograh-files.priority=30"
-      - "traefik.http.routers.dograh-files.service=dograh-files"
-      # Subidas directas del navegador (documentos de conocimiento, CSV de
-      # campañas, audios de saludo). El bucket acepta PUT anónimo, así que
-      # solo se permite desde las IPs listadas. Por defecto, nadie.
-      - "traefik.http.routers.dograh-files-upload.rule=Host(`${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}`) && PathRegexp(`^/voice-audio/.+`) && (Method(`PUT`) || Method(`OPTIONS`))"
-      - "traefik.http.routers.dograh-files-upload.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
-      - "traefik.http.routers.dograh-files-upload.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
-      - "traefik.http.routers.dograh-files-upload.priority=30"
-      - "traefik.http.routers.dograh-files-upload.service=dograh-files"
-      - "traefik.http.routers.dograh-files-upload.middlewares=dograh-upload-allowlist"
-      - "traefik.http.middlewares.dograh-upload-allowlist.ipallowlist.sourcerange=${DOGRAH_UPLOAD_ALLOWED_IPS:-127.0.0.1/32}"
-      - "traefik.http.services.dograh-files.loadbalancer.server.port=9000"
-    networks:
-      - app-network
-      - traefik
+    profiles: !override ["disabled-agentrix"]
 
   # Solo se usa con --profile local-turn, para renderizar turnserver.conf.
   # ENVIRONMENT=local a propósito: en modo production este init también exige
@@ -94,18 +69,33 @@ services:
     image: ${REGISTRY:-dograhai}/dograh-api:${DOGRAH_VERSION:-1.47.0}
     restart: unless-stopped
     ports: !reset []
+    # Sin MinIO: el API solo espera a Postgres y Redis.
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
+      # Almacenamiento S3 externo (ver servicio minio arriba).
+      ENABLE_AWS_S3: "true"
+      S3_BUCKET: "${S3_BUCKET:?S3_BUCKET es obligatorio (bucket de Megas4 para Dograh)}"
+      S3_REGION: "${S3_REGION:?S3_REGION es obligatorio}"
+      S3_ENDPOINT_URL: "${S3_ENDPOINT_URL:?S3_ENDPOINT_URL es obligatorio, con https://}"
+      S3_SIGNATURE_VERSION: "${S3_SIGNATURE_VERSION:-s3v4}"
+      S3_ADDRESSING_STYLE: "${S3_ADDRESSING_STYLE:-path}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID es obligatorio}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY es obligatorio}"
+
       # production: filtra candidatos ICE privados y ordena TURN con UDP primero.
       ENVIRONMENT: "production"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
       OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET debe ser un secreto fuerte}"
 
       # Origen público del API: webhooks de Twilio, wss:// de medios, URLs de
-      # descarga del webhook post-llamada y objetos de MinIO.
+      # descarga del webhook post-llamada.
       PUBLIC_HOST: "${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
       PUBLIC_BASE_URL: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
       BACKEND_API_ENDPOINT: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
-      MINIO_PUBLIC_ENDPOINT: "https://${DOGRAH_API_HOST:-voice-api.agentrixlabs.com.co}"
       UI_APP_URL: "https://${DOGRAH_UI_HOST:-voice.agentrixlabs.com.co}"
 
       # Traefik solo apunta a un puerto (8000). Con más workers, los demás

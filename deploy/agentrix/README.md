@@ -11,6 +11,8 @@ Este directorio no modifica `api/` ni `ui/`. Solo añade:
 
 La guía funcional (workflow, BYOK, Twilio, n8n y protocolo de comparación) está en `mateopiza/agentrix-app`, en `docs/VOZ_DOGRAH_POC.md`.
 
+> **Almacenamiento (2026-10-03):** este despliegue ya **no usa MinIO**. MinIO dejó de publicar imágenes gratuitas (`quay.io/minio/minio` y `minio/minio` ya no se descargan), así que el override desactiva el servicio y el API guarda grabaciones, transcripciones y documentos en un **S3 externo (Megas4)** con URLs firmadas. Variables: `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT_URL` (con `https://`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, y opcionales `S3_ADDRESSING_STYLE=path` y `S3_SIGNATURE_VERSION=s3v4`. El bucket necesita CORS que permita `GET`/`PUT` desde `https://voice.agentrixlabs.com.co` (subidas directas del navegador). Las menciones a MinIO, `/voice-audio/` y `DOGRAH_UPLOAD_ALLOWED_IPS` de las secciones siguientes ya no aplican; los backups de archivos se hacen en el lado de Megas4.
+
 ## Arquitectura
 
 ```
@@ -18,10 +20,9 @@ La guía funcional (workflow, BYOK, Twilio, n8n y protocolo de comparación) est
 Navegador ─HTTPS──► │ voice.agentrixlabs.com.co      → ui:3010   │
                     │   └─ /api/v1 (mismo origen)    → api:8000  │
 Twilio ──HTTPS/WSS► │ voice-api.agentrixlabs.com.co  → api:8000  │
-n8n ───HTTPS──────► │   └─ /voice-audio/<objeto>     → minio:9000│ (solo GET/HEAD)
                     └────────────────────────────────────────────┘
 Navegador ═UDP════► coturn (3478, 5349, 49152-49200) ── audio WebRTC
-api ──HTTPS──► proveedores BYOK (Deepgram, LLM, ElevenLabs/Cartesia) y services.dograh.com (MPS)
+api ──HTTPS──► proveedores BYOK (Deepgram, LLM, ElevenLabs/Cartesia), services.dograh.com (MPS) y S3 (Megas4)
 ```
 
 - **Twilio Media Streams** usa WebSocket sobre TCP (`wss://voice-api…/api/v1/telephony/ws/...`). Pasa por Traefik sin configuración extra.
